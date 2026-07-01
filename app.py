@@ -29,9 +29,18 @@ import streamlit as st
 # ----------------------------- core pipeline -----------------------------
 
 def load_image(uploaded_file, max_width=1200):
-    """Load an uploaded file (jpg/png) into an OpenCV BGR array, resized."""
+    """Load an uploaded file (jpg/png/heic) into an OpenCV BGR array, resized."""
+    name = uploaded_file.name.lower()
     raw_bytes = uploaded_file.read()
-    pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+    if name.endswith(".heic") or name.endswith(".heif"):
+        import pillow_heif
+        heif_file = pillow_heif.read_heif(raw_bytes)
+        pil_img = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw")
+        pil_img = pil_img.convert("RGB")
+    else:
+        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
     img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     scale = max_width / img.shape[1]
     img = cv2.resize(img, None, fx=scale, fy=scale)
@@ -160,7 +169,7 @@ with st.sidebar:
     min_object_size = st.slider("Minimum object size (px)", 5, 200, 40)
     arm_search_radius = st.slider("Arm search radius (px around embryo center)", 50, 600, 300)
 
-uploaded_file = st.file_uploader("Upload egg photo", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload egg photo", type=["jpg", "jpeg", "png", "heic", "heif"])
 
 if uploaded_file is not None:
     img = load_image(uploaded_file)
