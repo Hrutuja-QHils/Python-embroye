@@ -4,4 +4,5 @@ scikit-image
 skan
 networkx
 pillow
+pillow-heif
 numpy
