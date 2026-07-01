@@ -1,12 +1,12 @@
 """
-Streamlit app: Egg Vitelline Vessel Order Counter
-==================================================
-Upload an egg photo, click the embryo center, get primary/secondary/tertiary
-vessel counts + a color-coded overlay.
+Streamlit app: Egg Vitelline Vessel Order Counter (Fully Automatic)
+====================================================================
+Upload an egg photo -> the app automatically finds the embryo center and
+counts primary / secondary / tertiary blood vessel branches. No clicking
+required.
 
 Install:
-    pip install streamlit streamlit-image-coordinates opencv-python-headless \
-                scikit-image skan networkx pillow pillow-heif --break-system-packages
+    pip install -r requirements.txt
 
 Run:
     streamlit run app.py
@@ -24,27 +24,33 @@ from skimage import img_as_float
 from skan import Skeleton, summarize
 
 import streamlit as st
-from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 # ----------------------------- core pipeline -----------------------------
 
 def load_image(uploaded_file, max_width=1200):
-    """Load an uploaded file (jpg/png/heic) into an OpenCV BGR array, resized."""
-    name = uploaded_file.name.lower()
+    """Load an uploaded file (jpg/png) into an OpenCV BGR array, resized."""
     raw_bytes = uploaded_file.read()
-
-    if name.endswith(".heic"):
-        import pillow_heif
-        heif_file = pillow_heif.read_heif(raw_bytes)
-        pil_img = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw")
-    else:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-
+    pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     scale = max_width / img.shape[1]
     img = cv2.resize(img, None, fx=scale, fy=scale)
     return img
+
+
+def detect_embryo_center(img, blur_sigma=25):
+    """Automatically find the embryo hub.
+
+    The hub is a *wide* patch of elevated redness, while vessels are *thin*
+    lines of elevated redness. Heavily blurring the redness channel washes
+    out thin lines but preserves the wide hub, so its brightest point after
+    blurring is a reliable estimate of the embryo center.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    _, A, _ = cv2.split(lab)
+    A_blur = cv2.GaussianBlur(A, (0, 0), sigmaX=blur_sigma)
+    y, x = np.unravel_index(np.argmax(A_blur), A_blur.shape)
+    return (int(y), int(x))  # (row, col)
 
 
 def segment_vessels(img, frangi_threshold=6, close_kernel=5, close_iters=3, min_object_size=40):
@@ -79,76 +85,59 @@ def build_graph(skeleton_mask):
     return G, node_coords, skel_obj, branch_data
 
 
-def classify_orders(G, node_coords, root_center, hub_radius=90):
+def classify_orders(G, node_coords, root_center, arm_search_radius=300, min_arm_edges=3):
+    """Classify every vessel segment as primary/secondary/tertiary.
+
+    The embryo hub is usually a solid blob rather than a thin line, which
+    means skeletonizing it creates a mess right at the center and often
+    breaks the network into separate disconnected "arms" (one per primary
+    vessel). Rather than fight that, we treat each arm as an independent
+    tree rooted at whichever of its nodes sits closest to the embryo
+    center, and classify branch order *within* that arm:
+        hop 1 from the arm's root -> primary
+        hop 2                     -> secondary
+        hop 3+                    -> tertiary (capped)
+    """
+    def dist_to_root(n):
+        r, c = node_coords[n]
+        return ((r - root_center[0]) ** 2 + (c - root_center[1]) ** 2) ** 0.5
+
     components = list(nx.connected_components(G))
-    components.sort(key=len, reverse=True)
 
-    # Pick the component nearest the clicked root (not just the largest overall) —
-    # this matters if the mask fragmented into multiple pieces.
-    def min_dist_to_root(comp):
-        return min(
-            ((node_coords[n][0] - root_center[0]) ** 2 +
-             (node_coords[n][1] - root_center[1]) ** 2) ** 0.5
-            for n in comp
-        )
-
-    components.sort(key=min_dist_to_root)
-    main_nodes = components[0]
-    G_main = G.subgraph(main_nodes).copy()
-
-    hub_nodes = [
-        n for n in G_main.nodes()
-        if ((node_coords[n][0] - root_center[0]) ** 2 +
-            (node_coords[n][1] - root_center[1]) ** 2) ** 0.5 < hub_radius
-    ]
-
-    G2 = G_main.copy()
-    root_id = "ROOT"
-    G2.add_node(root_id)
-    for n in hub_nodes:
-        for nbr in G_main.neighbors(n):
-            if nbr not in hub_nodes:
-                G2.add_edge(root_id, nbr, length=G_main[n][nbr]["length"])
-        if G2.has_node(n):
-            G2.remove_node(n)
-
-    if root_id not in G2 or G2.degree(root_id) == 0:
-        return None, hub_nodes, main_nodes
-
-    hop = nx.single_source_shortest_path_length(G2, root_id)
+    arms = []
+    for comp in components:
+        if len(comp) < min_arm_edges:
+            continue
+        if min(dist_to_root(n) for n in comp) < arm_search_radius:
+            arms.append(comp)
 
     order_map = {}
-    for u, v in G2.edges():
-        if u == root_id or v == root_id:
-            order = 1
-        else:
+    for comp in arms:
+        Gc = G.subgraph(comp).copy()
+        local_root = min(comp, key=dist_to_root)
+        hop = nx.single_source_shortest_path_length(Gc, local_root)
+        for u, v in Gc.edges():
             order = min(hop.get(u, 999), hop.get(v, 999)) + 1
-        order_map[(u, v)] = min(order, 3)
+            order_map[(u, v)] = min(order, 3)
 
-    return order_map, hub_nodes, main_nodes
+    return order_map, arms
 
 
-def draw_overlay(img, skel_obj, branch_data, order_map, hub_nodes, main_nodes, root_center):
-    colors = {1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 0, 0)}  # BGR
+def draw_overlay(img, skel_obj, branch_data, order_map, root_center):
+    colors = {1: (0, 0, 255), 2: (0, 255, 0), 3: (255, 0, 0)}  # BGR: primary, secondary, tertiary
     overlay = img.copy()
 
     for i, row in branch_data.iterrows():
         src, dst = int(row["node-id-src"]), int(row["node-id-dst"])
-        if src not in main_nodes or dst not in main_nodes:
+        key = (src, dst) if (src, dst) in order_map else ((dst, src) if (dst, src) in order_map else None)
+        if key is None:
             continue
-        if src in hub_nodes or dst in hub_nodes:
-            color = colors[1]
-        elif (src, dst) in order_map:
-            color = colors[order_map[(src, dst)]]
-        elif (dst, src) in order_map:
-            color = colors[order_map[(dst, src)]]
-        else:
-            continue
+        color = colors[order_map[key]]
         coords = skel_obj.path_coordinates(i).astype(int)
         for (r, c) in coords:
             cv2.circle(overlay, (c, r), 1, color, -1)
 
-    cv2.circle(overlay, (root_center[1], root_center[0]), 6, (0, 255, 255), 2)
+    cv2.circle(overlay, (root_center[1], root_center[0]), 8, (0, 255, 255), 3)
     return overlay
 
 
@@ -157,88 +146,75 @@ def draw_overlay(img, skel_obj, branch_data, order_map, hub_nodes, main_nodes, r
 st.set_page_config(page_title="Egg Vessel Counter", layout="wide")
 st.title("🥚 Egg Vitelline Vessel Order Counter")
 st.write(
-    "Upload a candled/opened egg photo, click the embryo center (the hub all "
-    "vessels radiate from), and get primary / secondary / tertiary vessel counts."
+    "Upload a candled/opened egg photo. The app automatically finds the "
+    "embryo center and counts primary / secondary / tertiary vessel branches "
+    "— no clicking needed."
 )
 
 with st.sidebar:
-    st.header("Segmentation settings")
+    st.header("Settings")
+    st.caption("Defaults work well for most photos — only tweak if results look off.")
     frangi_threshold = st.slider("Frangi threshold", 1, 30, 6)
     close_kernel = st.slider("Gap-closing kernel size", 1, 15, 5, step=2)
     close_iters = st.slider("Gap-closing iterations", 1, 6, 3)
     min_object_size = st.slider("Minimum object size (px)", 5, 200, 40)
-    hub_radius = st.slider("Hub radius (px around clicked center)", 10, 200, 90)
+    arm_search_radius = st.slider("Arm search radius (px around embryo center)", 50, 600, 300)
 
-uploaded_file = st.file_uploader("Upload egg photo", type=["jpg", "jpeg", "png", "heic"])
+uploaded_file = st.file_uploader("Upload egg photo", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    if "img" not in st.session_state or st.session_state.get("filename") != uploaded_file.name:
-        st.session_state.img = load_image(uploaded_file)
-        st.session_state.filename = uploaded_file.name
-        st.session_state.root_center = None
+    img = load_image(uploaded_file)
 
-    img = st.session_state.img
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil_display = Image.fromarray(img_rgb)
+    with st.spinner("Detecting embryo center and analyzing vessels..."):
+        root_center = detect_embryo_center(img)
+        mask = segment_vessels(
+            img,
+            frangi_threshold=frangi_threshold,
+            close_kernel=close_kernel,
+            close_iters=close_iters,
+            min_object_size=min_object_size,
+        )
+        skeleton = skeletonize(mask > 0)
+        G, node_coords, skel_obj, branch_data = build_graph(skeleton)
+        order_map, arms = classify_orders(
+            G, node_coords, root_center, arm_search_radius=arm_search_radius
+        )
 
-    st.subheader("Step 1: Click the embryo center")
-    coords = streamlit_image_coordinates(pil_display, key="click")
-
-    if coords is not None:
-        st.session_state.root_center = (coords["y"], coords["x"])  # (row, col)
-
-    if st.session_state.root_center:
-        st.success(f"Root point set at (row={st.session_state.root_center[0]}, col={st.session_state.root_center[1]})")
-
-        if st.button("Run vessel analysis"):
-            with st.spinner("Segmenting vessels..."):
-                mask = segment_vessels(
-                    img,
-                    frangi_threshold=frangi_threshold,
-                    close_kernel=close_kernel,
-                    close_iters=close_iters,
-                    min_object_size=min_object_size,
-                )
-                skeleton = skeletonize(mask > 0)
-                G, node_coords, skel_obj, branch_data = build_graph(skeleton)
-                order_map, hub_nodes, main_nodes = classify_orders(
-                    G, node_coords, st.session_state.root_center, hub_radius=hub_radius
-                )
-
-            if order_map is None:
-                st.error(
-                    "No vessels found near the point you clicked. "
-                    "Try clicking closer to the vessel hub, or increase the hub radius."
-                )
-            else:
-                counts = Counter(order_map.values())
-                overlay = draw_overlay(
-                    img, skel_obj, branch_data, order_map, hub_nodes, main_nodes,
-                    st.session_state.root_center
-                )
-                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Primary", counts.get(1, 0))
-                col2.metric("Secondary", counts.get(2, 0))
-                col3.metric("Tertiary", counts.get(3, 0))
-
-                st.subheader("Classified overlay")
-                st.image(
-                    overlay_rgb,
-                    caption="Red = primary, Green = secondary, Blue = tertiary, Yellow = root",
-                    use_column_width=True,
-                )
-
-                buf = io.BytesIO()
-                Image.fromarray(overlay_rgb).save(buf, format="PNG")
-                st.download_button(
-                    "Download overlay image",
-                    data=buf.getvalue(),
-                    file_name="vessel_classified_overlay.png",
-                    mime="image/png",
-                )
+    if not order_map:
+        st.error(
+            "No vessel network detected. Try lowering the Frangi threshold "
+            "or increasing the arm search radius in the sidebar."
+        )
     else:
-        st.info("Click on the image above to set the embryo center.")
+        counts = Counter(order_map.values())
+        overlay = draw_overlay(img, skel_obj, branch_data, order_map, root_center)
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Primary", counts.get(1, 0))
+        col2.metric("Secondary", counts.get(2, 0))
+        col3.metric("Tertiary", counts.get(3, 0))
+
+        st.subheader("Classified overlay")
+        st.image(
+            overlay_rgb,
+            caption="Red = primary, Green = secondary, Blue = tertiary, Yellow circle = detected embryo center",
+            use_column_width=True,
+        )
+
+        st.caption(
+            f"Detected {len(arms)} vessel arm(s) radiating from the embryo. "
+            "If the yellow circle isn't on the embryo, or an arm looks missing, "
+            "try adjusting the sliders in the sidebar."
+        )
+
+        buf = io.BytesIO()
+        Image.fromarray(overlay_rgb).save(buf, format="PNG")
+        st.download_button(
+            "Download overlay image",
+            data=buf.getvalue(),
+            file_name="vessel_classified_overlay.png",
+            mime="image/png",
+        )
 else:
     st.info("Upload an image to get started.")
